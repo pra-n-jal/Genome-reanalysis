@@ -1,0 +1,617 @@
+
+import argparse
+import logging
+import os
+
+import GEOparse
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy.stats import norm, ttest_ind
+
+try:
+    from cmapPy.pandasGEXpress import parse_gctx
+    CMAPPY_AVAILABLE = True
+except Exception:
+    CMAPPY_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+
+def get_labels(gse):
+    info = {}
+
+    for name, gsm in gse.gsms.items():
+        info[name] = {}
+
+        for key, value in gsm.metadata.items():
+            if isinstance(value, list):
+                value = ';'.join(value)
+            info[name][key] = value
+
+    samples = pd.DataFrame.from_dict(info, orient='index')
+
+    for col in samples.columns:
+        if any(x in col.lower() for x in
+               ['disease', 'characteristic', 'status', 'phenotype', 'diagnosis']):
+
+            values = samples[col].astype(str).str.lower()
+
+            labels = values.apply(
+                lambda x: 1 if any(word in x for word in
+                                   ['schizo', 'schizophrenia', 'patient', 'case'])
+                else 0 if any(word in x for word in
+                              ['control', 'healthy', 'normal'])
+                else -1
+            )
+
+            if (labels != -1).sum() >= 2:
+                return labels.replace(-1, 0).astype(int)
+
+    if 'title' in samples.columns:
+        values = samples['title'].astype(str).str.lower()
+
+        labels = values.apply(
+            lambda x: 1 if 'schizo' in x
+            else 0 if 'control' in x or 'healthy' in x
+            else -1
+        )
+
+        if (labels != -1).sum() >= 2:
+            return labels.replace(-1, 0).astype(int)
+
+    return None
+
+
+def build_expression(gse):
+    data = []
+    gsm_names = list(gse.gsms.keys())
+
+    for gsm in gsm_names:
+        table = gse.gsms[gsm].table
+
+        if 'VALUE' in table.columns:
+            value_col = 'VALUE'
+        else:
+            numeric_cols = table.select_dtypes(include=['number']).columns
+
+            if len(numeric_cols) == 0:
+                continue
+
+            value_col = numeric_cols[-1]
+
+        df = table[['ID_REF', value_col]].set_index('ID_REF')
+        df = df.rename(columns={value_col: gsm})
+        data.append(df)
+
+    if len(data) == 0:
+        raise Exception('No numeric columns found in GSM tables')
+
+    expr = pd.concat(data, axis=1)
+    expr = expr.apply(pd.to_numeric, errors='coerce')
+
+    if expr.max().max() > 1000:
+        expr = np.log2(expr + 1)
+
+    ranks = expr.rank(method='first')
+    rank_mean = (
+        expr.stack()
+        .groupby(ranks.stack().astype(int))
+        .mean()
+    )
+
+    expr = (
+        expr.rank(method='min')
+        .stack()
+        .astype(int)
+        .map(rank_mean)
+        .unstack()
+    )
+
+    return expr
+
+
+def map_probes(gse, expr):
+    try:
+        gpl = list(gse.gpls.values())[0]
+        annotation = gpl.table
+
+        symbol_cols = [
+            col for col in annotation.columns
+            if 'symbol' in col.lower() or 'gene' in col.lower()
+        ]
+
+        if len(symbol_cols) == 0:
+            return expr
+
+        if 'Gene Symbol' in annotation.columns:
+            symbol_col = 'Gene Symbol'
+        else:
+            symbol_col = symbol_cols[0]
+
+        mapping = annotation.set_index('ID')[symbol_col].to_dict()
+
+        result = expr.copy()
+        result.index = result.index.map(
+            lambda x: mapping.get(x, x)
+        )
+
+        result = result.groupby(result.index).median()
+
+        return result
+
+    except Exception:
+        return expr
+
+
+def differential_expression(expr, labels):
+    group1 = expr.loc[:, labels == 1]
+    group0 = expr.loc[:, labels == 0]
+
+    t_values, p_values = ttest_ind(
+        group1.values,
+        group0.values,
+        axis=1,
+        equal_var=False,
+        nan_policy='omit'
+    )
+
+    logfc = group1.mean(axis=1) - group0.mean(axis=1)
+
+    result = pd.DataFrame({
+        'gene': expr.index,
+        't': t_values,
+        'p': p_values,
+        'logFC': logfc.values
+    }).set_index('gene')
+
+    result['adj_p'] = (
+        result['p'] * len(result)
+    ).clip(upper=1.0)
+
+    return result
+
+
+def combine_results(results):
+    genes = sorted(
+        set().union(*[set(result.index) for result in results])
+    )
+
+    z_values = []
+    weights = []
+    logfc_values = []
+
+    for result in results:
+        result = result.reindex(genes).fillna({
+            'p': 1.0,
+            'logFC': 0
+        })
+
+        z = (
+            norm.isf(result['p'] / 2)
+            * np.sign(result['logFC'])
+        )
+
+        z_values.append(z.values)
+        weights.append(np.sqrt(result.shape[0]))
+        logfc_values.append(result['logFC'].values)
+
+    z_values = np.array(z_values)
+    weights = np.array(weights)[:, None]
+
+    z_combined = (
+        (weights * z_values).sum(axis=0)
+        / np.sqrt((weights ** 2).sum())
+    )
+
+    p_combined = 2 * norm.sf(np.abs(z_combined))
+    logfc_mean = np.nanmean(
+        np.array(logfc_values),
+        axis=0
+    )
+
+    return pd.DataFrame({
+        'gene': genes,
+        'logFC': logfc_mean,
+        'z_meta': z_combined,
+        'p_meta': p_combined
+    }).set_index('gene')
+
+
+def connectivity_score(up_genes, down_genes, values):
+    genes = values.dropna().index.tolist()
+    n = len(genes)
+
+    up_hits = [
+        i for i, gene in enumerate(genes)
+        if gene in up_genes
+    ]
+
+    down_hits = [
+        i for i, gene in enumerate(genes)
+        if gene in down_genes
+    ]
+
+    if len(up_hits) == 0 or len(down_hits) == 0:
+        return 0.0
+
+    def enrichment(hits):
+        ranks = [
+            (i + 1) / n
+            for i in sorted(hits)
+        ]
+
+        return sum(ranks) / len(ranks) - 0.5
+
+    return (
+        enrichment(up_hits)
+        - enrichment(down_hits)
+    )
+
+
+def run_connectivity(meta, lincs_path, outdir):
+    up_genes = set(
+        meta[meta['logFC'] > 0]
+        .sort_values('p_meta')
+        .head(250)
+        .index
+    )
+
+    down_genes = set(
+        meta[meta['logFC'] < 0]
+        .sort_values('p_meta')
+        .head(250)
+        .index
+    )
+
+    results = []
+    gene_contributions = []
+
+    if CMAPPY_AVAILABLE and lincs_path.endswith('.gctx'):
+        logging.info('Loading LINCS file...')
+
+        gctx = parse_gctx.parse(lincs_path)
+        data = gctx.data_df
+        row_meta = gctx.row_metadata_df
+
+        gene_col = next(
+            (
+                col for col in
+                ['pr_gene_symbol', 'gene_symbol', 'pr_gene_id']
+                if col in row_meta.columns
+            ),
+            row_meta.columns[0]
+        )
+
+        data.index = row_meta[gene_col].values
+
+        for perturbation in data.columns:
+            values = data[perturbation].dropna()
+
+            score = connectivity_score(
+                up_genes,
+                down_genes,
+                values
+            )
+
+            results.append((perturbation, score))
+
+            relevant = values.loc[
+                values.index.intersection(
+                    up_genes.union(down_genes)
+                )
+            ]
+
+            top_genes = (
+                relevant
+                .sort_values(ascending=False)
+                .head(50)
+            )
+
+            for gene, zscore in top_genes.items():
+                gene_contributions.append(
+                    (perturbation, gene, zscore)
+                )
+
+    else:
+        data = pd.read_csv(
+            lincs_path,
+            sep='\t',
+            low_memory=False
+        )
+
+        required = {'gene', 'pert_iname', 'zscore'}
+
+        if not required.issubset(data.columns):
+            raise Exception(
+                'LINCS file format not recognized and cmapPy not available'
+            )
+
+        for name, group in data.groupby('pert_iname'):
+            values = (
+                group
+                .set_index('gene')['zscore']
+                .dropna()
+            )
+
+            score = connectivity_score(
+                up_genes,
+                down_genes,
+                values
+            )
+
+            results.append((name, score))
+
+            relevant = values.loc[
+                values.index.intersection(
+                    up_genes.union(down_genes)
+                )
+            ]
+
+            top_genes = (
+                relevant
+                .sort_values(ascending=False)
+                .head(50)
+            )
+
+            for gene, zscore in top_genes.items():
+                gene_contributions.append(
+                    (name, gene, zscore)
+                )
+
+    result_df = pd.DataFrame(
+        results,
+        columns=['perturbation', 'score']
+    ).sort_values('score')
+
+    os.makedirs(outdir, exist_ok=True)
+
+    result_df.to_csv(
+        os.path.join(outdir, 'meta_connectivity.tsv'),
+        sep='\t',
+        index=False
+    )
+
+    gene_df = pd.DataFrame(
+        gene_contributions,
+        columns=['perturbation', 'gene', 'zscore']
+    )
+
+    gene_df.to_csv(
+        os.path.join(outdir, 'meta_connectivity_genes.tsv'),
+        sep='\t',
+        index=False
+    )
+
+    top = result_df.head(20)
+
+    plt.figure(figsize=(8, 6))
+    sns.barplot(
+        y='perturbation',
+        x='score',
+        data=top,
+        palette='viridis'
+    )
+    plt.title('Top 20 Connectivity Scores')
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(
+            outdir,
+            'top20_connectivity_barplot.png'
+        )
+    )
+    plt.close()
+
+    top_genes = gene_df[
+        gene_df['perturbation'].isin(top['perturbation'])
+    ]
+
+    pivot = top_genes.pivot_table(
+        index='gene',
+        columns='perturbation',
+        values='zscore',
+        fill_value=0
+    )
+
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(
+        pivot,
+        cmap='RdBu_r',
+        center=0
+    )
+    plt.title('Gene Contributions (Top Perturbations)')
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(
+            outdir,
+            'gene_contributions_heatmap.png'
+        )
+    )
+    plt.close()
+
+    logging.info('Saved connectivity results to %s', outdir)
+
+    return result_df, gene_df
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        '--geo_id',
+        nargs='+',
+        required=True
+    )
+
+    parser.add_argument(
+        '--lincs_path',
+        required=True
+    )
+
+    parser.add_argument(
+        '--outdir',
+        default='results'
+    )
+
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    dataset_results = []
+
+    for geo_id in args.geo_id:
+        try:
+            logging.info('Processing %s', geo_id)
+
+            geo_dir = os.path.join(
+                args.outdir,
+                geo_id
+            )
+
+            os.makedirs(geo_dir, exist_ok=True)
+
+            gse = GEOparse.get_GEO(
+                geo=geo_id,
+                destdir=geo_dir,
+                annotate_gpl=True
+            )
+
+            expr = build_expression(gse)
+
+            expr.to_csv(
+                os.path.join(
+                    geo_dir,
+                    'processed_expression.tsv'
+                ),
+                sep='\t'
+            )
+
+            expr_genes = map_probes(
+                gse,
+                expr
+            )
+
+            expr_genes.to_csv(
+                os.path.join(
+                    geo_dir,
+                    'expression_genes.tsv'
+                ),
+                sep='\t'
+            )
+
+            labels = get_labels(gse)
+
+            if labels is None:
+                sample_info = {}
+
+                for name, gsm in gse.gsms.items():
+                    sample_info[name] = {
+                        key: ';'.join(value)
+                        if isinstance(value, list)
+                        else value
+                        for key, value in gsm.metadata.items()
+                    }
+
+                sample_df = pd.DataFrame.from_dict(
+                    sample_info,
+                    orient='index'
+                )
+
+                sample_df.to_csv(
+                    os.path.join(
+                        geo_dir,
+                        'sample_metadata_autodetect_note.tsv'
+                    ),
+                    sep='\t'
+                )
+
+                logging.warning(
+                    'Could not detect labels for %s. Skipping.',
+                    geo_id
+                )
+
+                continue
+
+            common = [
+                col for col in expr_genes.columns
+                if col in labels.index
+            ]
+
+            expr_genes = expr_genes[common]
+            labels = labels.loc[common].astype(int)
+
+            de_result = differential_expression(
+                expr_genes,
+                labels
+            )
+
+            de_result.to_csv(
+                os.path.join(
+                    geo_dir,
+                    'differential_expression.tsv'
+                ),
+                sep='\t'
+            )
+
+            dataset_results.append(de_result)
+
+        except Exception as e:
+            logging.exception(
+                'Failed processing %s: %s',
+                geo_id,
+                e
+            )
+
+    if len(dataset_results) == 0:
+        raise Exception(
+            'No datasets produced DE results; '
+            'check sample metadata and inputs.'
+        )
+
+    if len(dataset_results) == 1:
+        meta = dataset_results[0]
+    else:
+        meta = combine_results(dataset_results)
+
+    meta_dir = os.path.join(
+        args.outdir,
+        'meta'
+    )
+
+    os.makedirs(meta_dir, exist_ok=True)
+
+    meta.to_csv(
+        os.path.join(
+            meta_dir,
+            'meta_signature.tsv'
+        ),
+        sep='\t'
+    )
+
+    logging.info('Wrote meta-signature')
+
+    connectivity, gene_df = run_connectivity(
+        meta,
+        args.lincs_path,
+        meta_dir
+    )
+
+    connectivity.head(50).to_csv(
+        os.path.join(
+            meta_dir,
+            'top50_connectivity.tsv'
+        ),
+        sep='\t',
+        index=False
+    )
+
+    logging.info(
+        'Pipeline completed. Results in %s',
+        args.outdir
+    )
+
+
+if __name__ == '__main__':
+    main()
+```

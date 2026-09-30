@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Data folders - Do NOT commit massive datasets!
+data/raw/*
+data/intermediate/*
+data/outputs/*
+!data/raw/.gitkeep
+!data/intermediate/.gitkeep
+!data/outputs/.gitkeep
+
+# Config / Logs
+config/*.txt
+config/*.yaml
+config/*.log
+!config/.gitkeep
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
